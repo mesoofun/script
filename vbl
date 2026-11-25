@@ -1,0 +1,713 @@
+local Players     = game:GetService("Players")
+local UIS         = game:GetService("UserInputService")
+local RunService  = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local Workspace   = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+
+local executorName = "Unknown"
+if identifyexecutor then
+    local ok, name = pcall(identifyexecutor)
+    if ok and name then executorName = name end
+end
+
+local FOLDER_NAME = "FASTFLAGS"
+if not isfolder(FOLDER_NAME) then
+    makefolder(FOLDER_NAME)
+end
+local SAVE_FILE = FOLDER_NAME .. "/FastFlags_Saved.json"
+
+local SCRIPT_INJECTED = false
+
+local ROTATE_DURATION = 0.01
+local autoShiftEnabled = false 
+local shiftHeld = false
+local rotating = false
+local rotateEndTime = 0
+local humConn, rotateConn
+
+local LINE_LENGTH    = 8
+local LINE_THICKNESS = 2
+local LINE_ALPHA     = 1
+local MAX_DISTANCE   = 2000
+local SHOW_LOCAL     = false
+
+local COLOR_SELF_TEAM = Color3.fromRGB(0, 255, 120)
+local COLOR_ENEMY     = Color3.fromRGB(255, 60, 60)
+local COLOR_NEUTRAL   = Color3.fromRGB(255, 255, 255)
+
+local tracers = {}
+local tracerVisible = false
+local tracerConn
+
+local function pressShift()
+    if shiftHeld then return end
+    shiftHeld = true
+    pcall(function() VirtualUser:CaptureController() end)
+    pcall(keypress, 0x10)
+end
+
+local function releaseShift()
+    if not shiftHeld then return end
+    shiftHeld = false
+    pcall(keyrelease, 0x10)
+end
+
+local function stopRotation()
+    rotating = false
+    if rotateConn then rotateConn:Disconnect(); rotateConn = nil end
+end
+
+local function startRotation()
+    if not autoShiftEnabled or rotating then return end
+    rotating = true
+    rotateEndTime = os.clock() + ROTATE_DURATION
+
+    rotateConn = RunService.RenderStepped:Connect(function()
+        local char = LocalPlayer.Character
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+        
+        if os.clock() >= rotateEndTime or not (hum and hrp) then
+            stopRotation()
+            return
+        end
+
+        local cam = Workspace.CurrentCamera
+        if not cam then return end
+
+        local look = cam.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude > 0.01 then
+            hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat.Unit)
+        end
+    end)
+end
+
+local function onCharacter(char)
+    if humConn then humConn:Disconnect(); humConn = nil end
+    stopRotation()
+
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+
+    humConn = hum.StateChanged:Connect(function(_, new)
+        if new == Enum.HumanoidStateType.Jumping or new == Enum.HumanoidStateType.Freefall then
+            if autoShiftEnabled then
+                pressShift()
+                startRotation()
+            end
+        elseif new == Enum.HumanoidStateType.Landed or new == Enum.HumanoidStateType.Running then
+            releaseShift()
+            stopRotation()
+        end
+    end)
+end
+
+if LocalPlayer.Character then onCharacter(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(onCharacter)
+
+local function getHead(player)
+    local char = player.Character
+    if not char then return nil end
+    local head = char:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then return head end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getLookVector(player)
+    local char = player.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:IsA("BasePart") then return hrp.CFrame.LookVector end
+    return nil
+end
+
+local function getColorForPlayer(player)
+    if player == LocalPlayer then return COLOR_SELF_TEAM end
+    local localTeam = LocalPlayer.Team
+    local playerTeam = player.Team
+    if not localTeam or not playerTeam then return COLOR_NEUTRAL end
+    return (localTeam == playerTeam) and COLOR_SELF_TEAM or COLOR_ENEMY
+end
+
+local function createTracer()
+    local line = Drawing.new("Line")
+    line.Visible, line.Thickness, line.Color, line.Transparency = false, LINE_THICKNESS, COLOR_NEUTRAL, LINE_ALPHA
+    line.From, line.To = Vector2.new(), Vector2.new()
+    return line
+end
+
+local function updateTracer(player, data)
+    if not tracerVisible then data.line.Visible = false; return end
+    local head, look = getHead(player), getLookVector(player)
+    if not head or not look then data.line.Visible = false; return end
+    local localChar = LocalPlayer.Character
+    local localHRP  = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    if localHRP and (head.Position - localHRP.Position).Magnitude > MAX_DISTANCE then
+        data.line.Visible = false; return
+    end
+
+    data.line.Color = getColorForPlayer(player)
+    local origin = head.Position
+    local target = origin + look * LINE_LENGTH
+    local originScreen, originOnScreen = Camera:WorldToViewportPoint(origin)
+    local targetScreen, targetOnScreen = Camera:WorldToViewportPoint(target)
+
+    if not (originOnScreen or targetOnScreen) then data.line.Visible = false; return end
+
+    local vp = Camera.ViewportSize
+    local function clampScreen(p)
+        return Vector2.new(math.clamp(p.X, -vp.X, vp.X * 2), math.clamp(p.Y, -vp.Y, vp.Y * 2))
+    end
+
+    data.line.From    = clampScreen(Vector2.new(originScreen.X, originScreen.Y))
+    data.line.To      = clampScreen(Vector2.new(targetScreen.X, targetScreen.Y))
+    data.line.Visible = true
+end
+
+local function setupPlayer(player)
+    if player == LocalPlayer and not SHOW_LOCAL then return end
+    if tracers[player] then return end
+    tracers[player] = { line = createTracer() }
+    player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if player.Parent and tracers[player] then tracers[player].line.Visible = false end
+    end)
+    player:GetPropertyChangedSignal("Team"):Connect(function()
+        if tracers[player] then tracers[player].line.Color = getColorForPlayer(player) end
+    end)
+end
+
+local function removeTracer(player)
+    local d = tracers[player]
+    if d then if d.line then d.line:Remove() end; tracers[player] = nil end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do setupPlayer(p) end
+Players.PlayerAdded:Connect(setupPlayer)
+Players.PlayerRemoving:Connect(removeTracer)
+
+LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+    for _, data in pairs(tracers) do if data.line then data.line.Color = getColorForPlayer(LocalPlayer) end end
+end)
+
+tracerConn = RunService.RenderStepped:Connect(function()
+    if not SCRIPT_INJECTED then return end
+    for player, data in pairs(tracers) do
+        if not player.Parent then removeTracer(player) else pcall(updateTracer, player, data) end
+    end
+end)
+
+UIS.InputBegan:Connect(function(input, gp)
+    if gp or not SCRIPT_INJECTED then return end
+    if input.KeyCode == Enum.KeyCode.Space and autoShiftEnabled then
+        pressShift(); startRotation()
+    elseif input.KeyCode == Enum.KeyCode.One then
+        autoShiftEnabled = not autoShiftEnabled
+        if not autoShiftEnabled then releaseShift(); stopRotation() end
+        print("[AutoShift] Включен: " .. tostring(autoShiftEnabled))
+    elseif input.KeyCode == Enum.KeyCode.Two then
+        tracerVisible = not tracerVisible
+        if not tracerVisible then for _, data in pairs(tracers) do data.line.Visible = false end end
+        print("[Tracer] Включен: " .. tostring(tracerVisible))
+    end
+end)
+
+UIS.InputEnded:Connect(function(input, gp)
+    if gp or not SCRIPT_INJECTED then return end
+    if input.KeyCode == Enum.KeyCode.Space then releaseShift() end
+end)
+
+local function createCorner(parent, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = parent
+    return c
+end
+
+local function createStroke(parent, color, trans)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Color3.fromRGB(232, 164, 205)
+    s.Thickness = 1
+    s.Transparency = trans or 0.5
+    s.Parent = parent
+    return s
+end
+
+local holder = LocalPlayer:WaitForChild("PlayerGui")
+
+local mainGui = Instance.new("ScreenGui")
+mainGui.Name = "MesooFunUI"
+mainGui.ResetOnSpawn = false
+mainGui.IgnoreGuiInset = true
+mainGui.DisplayOrder = 10001
+mainGui.Parent = holder
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.fromOffset(460, 360)
+mainFrame.Position = UDim2.new(0.5, -230, 0.5, -180)
+mainFrame.BackgroundColor3 = Color3.fromRGB(27, 21, 30)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = mainGui
+createCorner(mainFrame, 12)
+createStroke(mainFrame)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(35, 28, 38)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+createCorner(titleBar, 12)
+
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(1, -20, 1, 0)
+titleText.Position = UDim2.new(0, 10, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Font = Enum.Font.GothamBold
+titleText.TextSize = 13
+titleText.TextColor3 = Color3.fromRGB(242, 236, 244)
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.Text = "MesooFun Hub | F1 to Hide"
+titleText.Parent = titleBar
+
+local separator = Instance.new("Frame")
+separator.Size = UDim2.new(1, 0, 0, 1)
+separator.Position = UDim2.new(0, 0, 1, 0)
+separator.BackgroundColor3 = Color3.fromRGB(232, 164, 205)
+separator.BackgroundTransparency = 0.7
+separator.BorderSizePixel = 0
+separator.Parent = titleBar
+
+local sideBar = Instance.new("Frame")
+sideBar.Size = UDim2.new(0, 100, 1, -40)
+sideBar.Position = UDim2.new(0, 8, 0, 40)
+sideBar.BackgroundTransparency = 1
+sideBar.Parent = mainFrame
+
+local sideLayout = Instance.new("UIListLayout")
+sideLayout.SortOrder = Enum.SortOrder.LayoutOrder
+sideLayout.Padding = UDim.new(0, 6)
+sideLayout.Parent = sideBar
+
+local contentArea = Instance.new("Frame")
+contentArea.Size = UDim2.new(1, -120, 1, -48)
+contentArea.Position = UDim2.new(0, 110, 0, 40)
+contentArea.BackgroundColor3 = Color3.fromRGB(24, 19, 27)
+contentArea.BorderSizePixel = 0
+contentArea.Parent = mainFrame
+createCorner(contentArea, 8)
+
+local function createTab(text, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 30)
+    btn.BackgroundColor3 = Color3.fromRGB(43, 33, 45)
+    btn.BackgroundTransparency = 0.5
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.TextColor3 = Color3.fromRGB(170, 162, 175)
+    btn.Text = text
+    btn.LayoutOrder = order
+    btn.Parent = sideBar
+    createCorner(btn, 6)
+    return btn
+end
+
+local tabFPS = createTab("FPS", 1)
+local tabFF = createTab("FastFlags", 2)
+local tabVBL = createTab("VBL", 3)
+
+local fpsContainer = Instance.new("Frame")
+fpsContainer.Size = UDim2.new(1, 0, 1, 0)
+fpsContainer.BackgroundTransparency = 1
+fpsContainer.Parent = contentArea
+
+local ffContainer = Instance.new("Frame")
+ffContainer.Size = UDim2.new(1, 0, 1, 0)
+ffContainer.BackgroundTransparency = 1
+ffContainer.Visible = false
+ffContainer.Parent = contentArea
+
+local vblContainer = Instance.new("Frame")
+vblContainer.Size = UDim2.new(1, 0, 1, 0)
+vblContainer.BackgroundTransparency = 1
+vblContainer.Visible = false
+vblContainer.Parent = contentArea
+
+local function switchTab(activeBtn, activeContainer, inactiveBtn1, inactiveContainer1, inactiveBtn2, inactiveContainer2)
+    activeBtn.BackgroundTransparency = 0.15
+    activeBtn.TextColor3 = Color3.fromRGB(242, 236, 244)
+    inactiveBtn1.BackgroundTransparency = 0.5
+    inactiveBtn1.TextColor3 = Color3.fromRGB(170, 162, 175)
+    inactiveBtn2.BackgroundTransparency = 0.5
+    inactiveBtn2.TextColor3 = Color3.fromRGB(170, 162, 175)
+    activeContainer.Visible = true
+    inactiveContainer1.Visible = false
+    inactiveContainer2.Visible = false
+end
+
+tabFPS.MouseButton1Click:Connect(function() switchTab(tabFPS, fpsContainer, tabFF, ffContainer, tabVBL, vblContainer) end)
+tabFF.MouseButton1Click:Connect(function() switchTab(tabFF, ffContainer, tabFPS, fpsContainer, tabVBL, vblContainer) end)
+tabVBL.MouseButton1Click:Connect(function() switchTab(tabVBL, vblContainer, tabFPS, fpsContainer, tabFF, ffContainer) end)
+switchTab(tabFPS, fpsContainer, tabFF, ffContainer, tabVBL, vblContainer)
+
+local fpsPad = Instance.new("UIPadding")
+fpsPad.PaddingTop, fpsPad.PaddingLeft = UDim.new(0, 10), UDim.new(0, 10)
+fpsPad.Parent = fpsContainer
+
+local fpsInput = Instance.new("TextBox")
+fpsInput.Size = UDim2.new(1, -10, 0, 32)
+fpsInput.Position = UDim2.new(0, 0, 0, 0)
+fpsInput.BackgroundColor3 = Color3.fromRGB(27, 21, 30)
+fpsInput.TextColor3 = Color3.fromRGB(242, 236, 244)
+fpsInput.PlaceholderText = "Enter FPS (e.g. 144)"
+fpsInput.PlaceholderColor3 = Color3.fromRGB(150, 140, 152)
+fpsInput.Font = Enum.Font.GothamMedium
+fpsInput.TextSize = 12
+fpsInput.Text = ""
+fpsInput.Parent = fpsContainer
+createCorner(fpsInput, 6)
+
+local fpsBtn = Instance.new("TextButton")
+fpsBtn.Size = UDim2.new(1, -10, 0, 32)
+fpsBtn.Position = UDim2.new(0, 0, 0, 40)
+fpsBtn.BackgroundColor3 = Color3.fromRGB(232, 164, 205)
+fpsBtn.Font = Enum.Font.GothamBold
+fpsBtn.TextSize = 12
+fpsBtn.TextColor3 = Color3.fromRGB(32, 24, 32)
+fpsBtn.Text = "Set FPS Limit"
+fpsBtn.Parent = fpsContainer
+createCorner(fpsBtn, 6)
+
+local fpsStatus = Instance.new("TextLabel")
+fpsStatus.Size = UDim2.new(1, -10, 0, 20)
+fpsStatus.Position = UDim2.new(0, 0, 0, 80)
+fpsStatus.BackgroundTransparency = 1
+fpsStatus.Font = Enum.Font.GothamMedium
+fpsStatus.TextSize = 11
+fpsStatus.TextColor3 = Color3.fromRGB(170, 162, 175)
+fpsStatus.TextXAlignment = Enum.TextXAlignment.Left
+fpsStatus.Text = "Current limit: Default"
+fpsStatus.Parent = fpsContainer
+
+fpsBtn.MouseButton1Click:Connect(function()
+    local fps = tonumber(fpsInput.Text)
+    if fps then
+        setfpscap(math.floor(fps)) 
+        fpsStatus.Text = "Current limit: " .. tostring(math.floor(fps))
+        fpsStatus.TextColor3 = Color3.fromRGB(170, 226, 178)
+    else
+        fpsStatus.Text = "Error: Invalid number!"
+        fpsStatus.TextColor3 = Color3.fromRGB(255, 120, 130)
+    end
+end)
+
+local ffPad = Instance.new("UIPadding")
+ffPad.PaddingTop, ffPad.PaddingLeft = UDim.new(0, 10), UDim.new(0, 10)
+ffPad.Parent = ffContainer
+
+local ffBox = Instance.new("TextBox")
+ffBox.Size = UDim2.new(1, -10, 1, -120) 
+ffBox.Position = UDim2.new(0, 0, 0, 0)
+ffBox.BackgroundColor3 = Color3.fromRGB(27, 21, 30)
+ffBox.TextColor3 = Color3.fromRGB(242, 236, 244)
+ffBox.PlaceholderText = "Paste JSON here..."
+ffBox.PlaceholderColor3 = Color3.fromRGB(150, 140, 152)
+ffBox.Text = ""
+ffBox.Font = Enum.Font.Code
+ffBox.TextSize = 11
+ffBox.TextXAlignment = Enum.TextXAlignment.Left
+ffBox.TextYAlignment = Enum.TextYAlignment.Top
+ffBox.MultiLine = true
+ffBox.ClearTextOnFocus = false
+ffBox.TextWrapped = true
+ffBox.Parent = ffContainer
+createCorner(ffBox, 6)
+
+local btnFile = Instance.new("TextButton")
+btnFile.Size = UDim2.new(0, 95, 0, 24)
+btnFile.Position = UDim2.new(0, 0, 1, -84)
+btnFile.BackgroundColor3 = Color3.fromRGB(43, 33, 45)
+btnFile.Font = Enum.Font.GothamBold
+btnFile.TextSize = 11
+btnFile.TextColor3 = Color3.fromRGB(242, 236, 244)
+btnFile.Text = "Load .json"
+btnFile.Parent = ffContainer
+createCorner(btnFile, 4)
+
+local fileMenu = Instance.new("ScrollingFrame")
+fileMenu.Size = UDim2.new(0, 200, 0, 150)
+fileMenu.Position = UDim2.new(0, 100, 1, -84)
+fileMenu.BackgroundColor3 = Color3.fromRGB(35, 28, 38)
+fileMenu.BorderSizePixel = 0
+fileMenu.ScrollBarThickness = 4
+fileMenu.ScrollBarImageColor3 = Color3.fromRGB(232, 164, 205)
+fileMenu.Visible = false
+fileMenu.ZIndex = 10
+fileMenu.Parent = ffContainer
+createCorner(fileMenu, 6)
+createStroke(fileMenu)
+
+local fileLayout = Instance.new("UIListLayout")
+fileLayout.Padding = UDim.new(0, 4)
+fileLayout.SortOrder = Enum.SortOrder.Name
+fileLayout.Parent = fileMenu
+
+local filePad = Instance.new("UIPadding")
+filePad.PaddingTop, filePad.PaddingLeft = UDim.new(0, 5), UDim.new(0, 5)
+filePad.Parent = fileMenu
+
+local function refreshFileList()
+    for _, child in ipairs(fileMenu:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("TextLabel") then child:Destroy() end
+    end
+    
+    local files = listfiles(FOLDER_NAME)
+    local hasFiles = false
+    
+    if files then
+        for _, file in ipairs(files) do
+            local lowerFile = string.lower(file)
+            if string.sub(lowerFile, -5) == ".json" then
+                hasFiles = true
+                local btn = Instance.new("TextButton")
+                btn.Size = UDim2.new(1, -5, 0, 20)
+                btn.BackgroundColor3 = Color3.fromRGB(50, 40, 55)
+                btn.Font = Enum.Font.GothamMedium
+                btn.TextSize = 10
+                btn.TextColor3 = Color3.fromRGB(242, 236, 244)
+                btn.Text = file
+                btn.TextXAlignment = Enum.TextXAlignment.Left
+                btn.Parent = fileMenu
+                createCorner(btn, 3)
+                
+                local btnPad = Instance.new("UIPadding")
+                btnPad.PaddingLeft = UDim.new(0, 5)
+                btnPad.Parent = btn
+                
+                btn.MouseButton1Click:Connect(function()
+                    local success, content = pcall(readfile, FOLDER_NAME .. "/" .. file)
+                    if success and content then
+                        ffBox.Text = content
+                        ffStatus.Text = "Loaded: " .. file
+                        ffStatus.TextColor3 = Color3.fromRGB(170, 226, 178)
+                        fileMenu.Visible = false
+                    end
+                end)
+            end
+        end
+    end
+    
+    if not hasFiles then
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -5, 0, 20)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamMedium
+        lbl.TextSize = 10
+        lbl.TextColor3 = Color3.fromRGB(170, 162, 175)
+        lbl.Text = "No .json files in /FASTFLAGS"
+        lbl.Parent = fileMenu
+    end
+end
+
+btnFile.MouseButton1Click:Connect(function()
+    fileMenu.Visible = not fileMenu.Visible
+    if fileMenu.Visible then
+        refreshFileList()
+    end
+end)
+
+local btnRow = Instance.new("Frame")
+btnRow.Size = UDim2.new(1, -10, 0, 30)
+btnRow.Position = UDim2.new(0, 0, 1, -30)
+btnRow.BackgroundTransparency = 1
+btnRow.Parent = ffContainer
+
+local function createSmallBtn(text, color, xPos, parent)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 95, 1, 0)
+    b.Position = UDim2.new(0, xPos, 0, 0)
+    b.BackgroundColor3 = color
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 11
+    b.TextColor3 = Color3.fromRGB(242, 236, 244)
+    b.Text = text
+    b.Parent = parent
+    createCorner(b, 4)
+    return b
+end
+
+local btnApply = createSmallBtn("Apply", Color3.fromRGB(50, 40, 55), 0, btnRow)
+local btnDisable = createSmallBtn("Disable", Color3.fromRGB(50, 40, 55), 102, btnRow)
+local btnClear = createSmallBtn("Clear", Color3.fromRGB(50, 40, 55), 204, btnRow)
+
+local ffStatus = Instance.new("TextLabel")
+ffStatus.Size = UDim2.new(1, 0, 0, 20)
+ffStatus.Position = UDim2.new(0, 0, 1, -58)
+ffStatus.BackgroundTransparency = 1
+ffStatus.Font = Enum.Font.GothamMedium
+ffStatus.TextSize = 11
+ffStatus.TextColor3 = Color3.fromRGB(170, 162, 175)
+ffStatus.TextXAlignment = Enum.TextXAlignment.Left
+ffStatus.Text = "Ready."
+ffStatus.Parent = ffContainer
+
+if isfile(SAVE_FILE) then
+    local success, content = pcall(readfile, SAVE_FILE)
+    if success and content then
+        ffBox.Text = content
+        ffStatus.Text = "Loaded saved flags."
+    end
+end
+
+local appliedFlags = {}
+
+local function applyFlags()
+    local jsonString = ffBox.Text
+    if jsonString == "" then
+        ffStatus.Text = "Error: JSON is empty."
+        ffStatus.TextColor3 = Color3.fromRGB(255, 120, 130)
+        return
+    end
+    
+    local success, decoded = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(jsonString)
+    end)
+    
+    if not success or type(decoded) ~= "table" then
+        ffStatus.Text = "Error: Invalid JSON format."
+        ffStatus.TextColor3 = Color3.fromRGB(255, 120, 130)
+        return
+    end
+    
+    pcall(writefile, SAVE_FILE, jsonString)
+    local count = 0
+    appliedFlags = {}
+    
+    for flag, value in pairs(decoded) do
+        local valType = type(value)
+        local formattedValue = value
+        if valType == "boolean" then formattedValue = value and "True" or "False" end
+        
+        local ok = pcall(setfflag, flag, formattedValue)
+        if ok then
+            count = count + 1
+            appliedFlags[flag] = valType
+        end
+    end
+    
+    ffStatus.Text = "Applied & Saved " .. tostring(count) .. " flags."
+    ffStatus.TextColor3 = Color3.fromRGB(170, 226, 178)
+end
+
+local function disableFlags()
+    local count = 0
+    for flag, valType in pairs(appliedFlags) do
+        local resetValue = ""
+        if valType == "boolean" then resetValue = "False"
+        elseif valType == "number" then resetValue = 0
+        end
+        if pcall(setfflag, flag, resetValue) then count = count + 1 end
+    end
+    appliedFlags = {}
+    ffStatus.Text = "Attempted to reset " .. tostring(count) .. " flags."
+    ffStatus.TextColor3 = Color3.fromRGB(232, 200, 140)
+end
+
+local function clearText()
+    ffBox.Text = ""
+    ffStatus.Text = "Text cleared."
+    ffStatus.TextColor3 = Color3.fromRGB(170, 162, 175)
+end
+
+btnApply.MouseButton1Click:Connect(applyFlags)
+btnDisable.MouseButton1Click:Connect(disableFlags)
+btnClear.MouseButton1Click:Connect(clearText)
+
+local vblPad = Instance.new("UIPadding")
+vblPad.PaddingTop, vblPad.PaddingLeft = UDim.new(0, 10), UDim.new(0, 10)
+vblPad.Parent = vblContainer
+
+local vblTitle = Instance.new("TextLabel")
+vblTitle.Size = UDim2.new(1, -10, 0, 30)
+vblTitle.BackgroundTransparency = 1
+vblTitle.Font = Enum.Font.GothamBold
+vblTitle.TextSize = 14
+vblTitle.TextColor3 = Color3.fromRGB(242, 236, 244)
+vblTitle.TextXAlignment = Enum.TextXAlignment.Left
+vblTitle.Text = "Volleyball Legends Cheats"
+vblTitle.Parent = vblContainer
+
+local vblDesc = Instance.new("TextLabel")
+vblDesc.Size = UDim2.new(1, -10, 0, 40)
+vblDesc.Position = UDim2.new(0, 0, 0, 35)
+vblDesc.BackgroundTransparency = 1
+vblDesc.Font = Enum.Font.GothamMedium
+vblDesc.TextSize = 12
+vblDesc.TextColor3 = Color3.fromRGB(170, 162, 175)
+vblDesc.TextXAlignment = Enum.TextXAlignment.Left
+vblDesc.TextYAlignment = Enum.TextYAlignment.Top
+vblDesc.TextWrapped = true
+vblDesc.Text = "Click the button below to inject the VBL script.\nEnables Auto-Shiftlock (Key 1) and Tracers (Key 2)."
+vblDesc.Parent = vblContainer
+
+local btnInject = Instance.new("TextButton")
+btnInject.Size = UDim2.new(1, -10, 0, 40)
+btnInject.Position = UDim2.new(0, 0, 0, 85)
+btnInject.BackgroundColor3 = Color3.fromRGB(232, 164, 205)
+btnInject.Font = Enum.Font.GothamBold
+btnInject.TextSize = 14
+btnInject.TextColor3 = Color3.fromRGB(32, 24, 32)
+btnInject.Text = "Inject VBL Script"
+btnInject.Parent = vblContainer
+createCorner(btnInject, 6)
+
+local vblStatus = Instance.new("TextLabel")
+vblStatus.Size = UDim2.new(1, -10, 0, 20)
+vblStatus.Position = UDim2.new(0, 0, 0, 135)
+vblStatus.BackgroundTransparency = 1
+vblStatus.Font = Enum.Font.GothamMedium
+vblStatus.TextSize = 11
+vblStatus.TextColor3 = Color3.fromRGB(170, 162, 175)
+vblStatus.TextXAlignment = Enum.TextXAlignment.Left
+vblStatus.Text = "Status: Not Injected"
+vblStatus.Parent = vblContainer
+
+btnInject.MouseButton1Click:Connect(function()
+    if not SCRIPT_INJECTED then
+        SCRIPT_INJECTED = true
+        btnInject.Text = "Script Injected"
+        btnInject.BackgroundColor3 = Color3.fromRGB(50, 40, 55)
+        vblStatus.Text = "Status: Injected (Keys 1 & 2 active)"
+        vblStatus.TextColor3 = Color3.fromRGB(170, 226, 178)
+    else
+        SCRIPT_INJECTED = false
+        btnInject.Text = "Inject VBL Script"
+        btnInject.BackgroundColor3 = Color3.fromRGB(232, 164, 205)
+        vblStatus.Text = "Status: Not Injected"
+        vblStatus.TextColor3 = Color3.fromRGB(170, 162, 175)
+        autoShiftEnabled = false
+        tracerVisible = false
+        for _, data in pairs(tracers) do data.line.Visible = false end
+        releaseShift()
+        stopRotation()
+    end
+end)
+
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.F1 then
+        mainGui.Enabled = not mainGui.Enabled
+    end
+end)
+
+if getgenv then
+    if getgenv().mesoofun_gui and getgenv().mesoofun_gui.Parent then
+        getgenv().mesoofun_gui:Destroy()
+    end
+    getgenv().mesoofun_gui = mainGui
+end
